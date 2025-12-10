@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 from pyrogram import Client
-from pyrogram.enums import ParseMode   # ✅ 新增：引入枚举
+from pyrogram.enums import ParseMode
 
 # ------------- 环境变量 -------------
 # 一定要在 Render Environment 里设置：
@@ -56,7 +56,7 @@ async def download_to_temp(url: str, suffix: str) -> str:
     """
     把远程 URL 下载到临时文件，返回本地路径
     """
-    async with httpx.AsyncClient(follow_redirects=True, timeout=300) as h:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600) as h:
         r = await h.get(url)
         r.raise_for_status()
         data = r.content
@@ -69,16 +69,25 @@ async def download_to_temp(url: str, suffix: str) -> str:
 
 def to_parse_mode_enum(mode_str: str | None):
     """
-    把 Node 传进来的字符串 parse_mode（"HTML" / "Markdown"）
-    转成 Pyrogram 需要的枚举；传错就当作 None。
+    把 Node 传进来的 parse_mode（可能是 "HTML"、"Markdown"，
+    也可能是 '"HTML"' 这种多一层引号的），转成 Pyrogram 的枚举；
+    有问题就返回 None（相当于不用 parse_mode）。
     """
     if not mode_str:
         return None
-    m = mode_str.strip().upper()
-    if m == "HTML":
+
+    s = str(mode_str).strip()
+
+    # 去掉外面多余的引号：比如 '"HTML"' / "'HTML'"
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+
+    s_up = s.upper()
+    if s_up == "HTML":
         return ParseMode.HTML
-    if m.startswith("MARKDOWN"):
+    if s_up.startswith("MARKDOWN"):
         return ParseMode.MARKDOWN
+
     # 其他乱七八糟的就不用 parse_mode，当普通文本
     return None
 
@@ -100,9 +109,10 @@ async def upload(req: UploadRequest):
         kind = (req.kind or "video").lower()
         suffix = ".mp4" if kind == "video" else ".jpg"
 
-        path = await download_to_temp(req.file_url, suffix=suffix)
+        pm = to_parse_mode_enum(req.parse_mode)
+        print(f"[UPLOAD] kind={kind} chat={req.chat_id} pm={pm} raw_pm={req.parse_mode} url={req.file_url}")
 
-        pm = to_parse_mode_enum(req.parse_mode)  # ✅ 转换成枚举
+        path = await download_to_temp(req.file_url, suffix=suffix)
 
         try:
             if kind == "video":
@@ -110,7 +120,7 @@ async def upload(req: UploadRequest):
                     chat_id=req.chat_id,
                     video=path,
                     caption=req.caption,
-                    parse_mode=pm,           # ✅ 用枚举
+                    parse_mode=pm,
                     supports_streaming=True,
                 )
             else:
@@ -118,7 +128,7 @@ async def upload(req: UploadRequest):
                     chat_id=req.chat_id,
                     photo=path,
                     caption=req.caption,
-                    parse_mode=pm,           # ✅ 用枚举
+                    parse_mode=pm,
                 )
         finally:
             try:
