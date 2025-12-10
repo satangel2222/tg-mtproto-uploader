@@ -54,17 +54,28 @@ async def health():
 
 async def download_to_temp(url: str, suffix: str) -> str:
     """
-    把远程 URL 下载到临时文件，返回本地路径
+    把远程 URL **流式** 下载到临时文件，返回本地路径
+    （不会把整个文件一次性塞进内存）
     """
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600) as h:
-        r = await h.get(url)
-        r.raise_for_status()
-        data = r.content
-
     fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-    return path
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as h:
+            async with h.stream("GET", url) as r:
+                r.raise_for_status()
+                with os.fdopen(fd, "wb") as f:
+                    async for chunk in r.aiter_bytes(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+        return path
+    except Exception:
+        # 出错时把空文件删掉
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
 
 
 def to_parse_mode_enum(mode_str: str | None):
@@ -110,7 +121,10 @@ async def upload(req: UploadRequest):
         suffix = ".mp4" if kind == "video" else ".jpg"
 
         pm = to_parse_mode_enum(req.parse_mode)
-        print(f"[UPLOAD] kind={kind} chat={req.chat_id} pm={pm} raw_pm={req.parse_mode} url={req.file_url}")
+        print(
+            f"[UPLOAD] kind={kind} chat={req.chat_id} "
+            f"pm={pm} raw_pm={req.parse_mode} url={req.file_url}"
+        )
 
         path = await download_to_temp(req.file_url, suffix=suffix)
 
