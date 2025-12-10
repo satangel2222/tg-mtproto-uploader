@@ -5,9 +5,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 from pyrogram import Client
+from pyrogram.enums import ParseMode   # ✅ 新增：引入枚举
 
 # ------------- 环境变量 -------------
-# Render Environment 里必须有：
+# 一定要在 Render Environment 里设置：
 # TG_API_ID, TG_API_HASH, TG_STRING_SESSION
 try:
     TG_API_ID = int(os.environ["TG_API_ID"])
@@ -29,29 +30,21 @@ client = Client(
 
 
 class UploadRequest(BaseModel):
-    # 目标频道 / 群：可以是 @xxx 或 数字 ID
     chat_id: str
-
-    # Node 可能传 file_url，也可能传 url，这里两个都兼容
-    file_url: str | None = None
-    url: str | None = None
-
-    caption: str | None = None       # 可选：文字
-    parse_mode: str | None = None    # 可选："HTML" / "Markdown"
-    kind: str = "video"              # "video" or "photo"
+    file_url: str
+    caption: str | None = None
+    parse_mode: str | None = None  # "HTML" / "Markdown" / None（Node 传字符串）
+    kind: str = "video"            # "video" or "photo"
 
 
 @app.on_event("startup")
 async def on_startup():
     await client.start()
-    me = await client.get_me()
-    print(f"[MTProto] logged in as {me.id} ({me.first_name})")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await client.stop()
-    print("[MTProto] client stopped")
 
 
 @app.get("/")
@@ -61,27 +54,33 @@ async def health():
 
 async def download_to_temp(url: str, suffix: str) -> str:
     """
-    把远程 URL 流式下载到临时文件，返回本地路径
-    不一次性读入内存，避免 900MB 直接撑爆内存。
+    把远程 URL 下载到临时文件，返回本地路径
     """
+    async with httpx.AsyncClient(follow_redirects=True, timeout=300) as h:
+        r = await h.get(url)
+        r.raise_for_status()
+        data = r.content
+
     fd, path = tempfile.mkstemp(suffix=suffix)
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as h:
-            async with h.stream("GET", url) as r:
-                r.raise_for_status()
-                with os.fdopen(fd, "wb") as f:
-                    async for chunk in r.aiter_bytes():
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-        return path
-    except Exception:
-        # 如果下载失败要把临时文件删掉
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        raise
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path
+
+
+def to_parse_mode_enum(mode_str: str | None):
+    """
+    把 Node 传进来的字符串 parse_mode（"HTML" / "Markdown"）
+    转成 Pyrogram 需要的枚举；传错就当作 None。
+    """
+    if not mode_str:
+        return None
+    m = mode_str.strip().upper()
+    if m == "HTML":
+        return ParseMode.HTML
+    if m.startswith("MARKDOWN"):
+        return ParseMode.MARKDOWN
+    # 其他乱七八糟的就不用 parse_mode，当普通文本
+    return None
 
 
 @app.post("/upload")
@@ -91,53 +90,43 @@ async def upload(req: UploadRequest):
     POST /upload
     {
       "chat_id": "@xxxx" 或 数字ID,
-      "file_url" 或 "url": "https://...",
+      "file_url": "https://...",
       "caption": "...",
       "parse_mode": "HTML",
       "kind": "video" | "photo"
     }
     """
-    # 1) 取真正的 URL
-    src_url = req.file_url or req.url
-    if not src_url:
-        raise HTTPException(status_code=400, detail="missing file_url/url")
-
     try:
         kind = (req.kind or "video").lower()
         suffix = ".mp4" if kind == "video" else ".jpg"
 
-        print(f"[UPLOAD] kind={kind} chat={req.chat_id} url={src_url}")
+        path = await download_to_temp(req.file_url, suffix=suffix)
 
-        # 2) 先下载到本地临时文件（流式）
-        path = await download_to_temp(src_url, suffix=suffix)
+        pm = to_parse_mode_enum(req.parse_mode)  # ✅ 转换成枚举
 
-        # 3) 再通过 MTProto 发送
         try:
             if kind == "video":
-                msg = await client.send_video(
+                m = await client.send_video(
                     chat_id=req.chat_id,
                     video=path,
                     caption=req.caption,
-                    parse_mode=req.parse_mode,
+                    parse_mode=pm,           # ✅ 用枚举
                     supports_streaming=True,
                 )
             else:
-                msg = await client.send_photo(
+                m = await client.send_photo(
                     chat_id=req.chat_id,
                     photo=path,
                     caption=req.caption,
-                    parse_mode=req.parse_mode,
+                    parse_mode=pm,           # ✅ 用枚举
                 )
         finally:
-            # 4) 不管成功失败，都尝试删除临时文件
             try:
                 os.remove(path)
             except OSError:
                 pass
 
-        return {"ok": True, "message_id": msg.id}
+        return {"ok": True, "message_id": m.id}
     except Exception as e:
         # 让 Node 能看到具体错误
-        err = f"uploader_error: {e.__class__.__name__}: {e}"
-        print("[ERROR]", err)
-        raise HTTPException(status_code=500, detail=err)
+        raise HTTPException(status_code=500, detail=f"uploader_error: {e}")
