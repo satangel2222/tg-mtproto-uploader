@@ -1,15 +1,16 @@
+# app.py
+# MTProto uploader v1.2 — 增加下载重试/稳定性（stream 下载到临时文件，重试机制）
 import os
 import tempfile
-
+import asyncio
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import httpx
 from pyrogram import Client
 from pyrogram.enums import ParseMode
 
 # ------------- 环境变量 -------------
-# 一定要在 Render Environment 里设置：
-# TG_API_ID, TG_API_HASH, TG_STRING_SESSION
+# 一定要在 Render / 环境里设置：TG_API_ID, TG_API_HASH, TG_STRING_SESSION
 try:
     TG_API_ID = int(os.environ["TG_API_ID"])
     TG_API_HASH = os.environ["TG_API_HASH"]
@@ -52,15 +53,14 @@ async def health():
     return {"ok": True, "message": "mtproto uploader is up"}
 
 
-async def download_to_temp(url: str, suffix: str) -> str:
+async def _download_to_temp_once(url: str, suffix: str, timeout: int = 600) -> str:
     """
-    把远程 URL **流式** 下载到临时文件，返回本地路径
-    （不会把整个文件一次性塞进内存）
+    把远程 URL **流式** 下载到临时文件，返回本地路径（单次尝试）
     """
     fd, path = tempfile.mkstemp(suffix=suffix)
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as h:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as h:
             async with h.stream("GET", url) as r:
                 r.raise_for_status()
                 with os.fdopen(fd, "wb") as f:
@@ -76,6 +76,26 @@ async def download_to_temp(url: str, suffix: str) -> str:
         except OSError:
             pass
         raise
+
+
+async def download_to_temp(url: str, suffix: str) -> str:
+    """
+    带重试的下载（3 次，指数退避），避免临时的网络中断导致直接失败。
+    返回本地文件路径（caller 负责删除）
+    """
+    attempts = 3
+    base_delay = 1.0
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return await _download_to_temp_once(url, suffix, timeout=None)  # timeout None => stream until done
+        except Exception as e:
+            last_exc = e
+            wait = base_delay * (2 ** i)
+            # 小优化：对常见连接重置做短重试
+            await asyncio.sleep(wait)
+    # 尝试完毕仍失败，抛出
+    raise last_exc
 
 
 def to_parse_mode_enum(mode_str: str | None):
@@ -126,6 +146,7 @@ async def upload(req: UploadRequest):
             f"pm={pm} raw_pm={req.parse_mode} url={req.file_url}"
         )
 
+        # 下载（带重试）
         path = await download_to_temp(req.file_url, suffix=suffix)
 
         try:
