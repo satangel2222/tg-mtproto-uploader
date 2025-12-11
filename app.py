@@ -52,23 +52,11 @@ async def health():
     return {"ok": True, "message": "mtproto uploader is up"}
 
 
-def is_http_url(u: str) -> bool:
-    if not u or not isinstance(u, str):
-        return False
-    s = u.strip()
-    if not s:
-        return False
-    return s.lower().startswith("http://") or s.lower().startswith("https://")
-
-
 async def download_to_temp(url: str, suffix: str) -> str:
     """
     把远程 URL **流式** 下载到临时文件，返回本地路径
     （不会把整个文件一次性塞进内存）
     """
-    if not is_http_url(url):
-        raise ValueError("file_url must be an http(s) URL")
-
     fd, path = tempfile.mkstemp(suffix=suffix)
 
     try:
@@ -129,9 +117,6 @@ async def upload(req: UploadRequest):
     }
     """
     try:
-        if not is_http_url(req.file_url):
-            raise HTTPException(status_code=400, detail=f"invalid_file_url: {req.file_url}")
-
         kind = (req.kind or "video").lower()
         suffix = ".mp4" if kind == "video" else ".jpg"
 
@@ -166,8 +151,6 @@ async def upload(req: UploadRequest):
                 pass
 
         return {"ok": True, "message_id": m.id}
-    except HTTPException:
-        raise
     except Exception as e:
         # 让 Node 能看到具体错误
         raise HTTPException(status_code=500, detail=f"uploader_error: {e}")
